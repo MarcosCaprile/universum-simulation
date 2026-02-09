@@ -1,0 +1,429 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from matplotlib.widgets import Slider, RadioButtons
+from mpl_toolkits.mplot3d import Axes3D  # notwendig für 3D
+
+# -----------------------------------------------------------
+# Einheiten:
+#  - Entfernung: Astronomische Einheiten (AU)
+#  - Zeit: Jahre
+#  - Masse: Sonnenmassen
+#  -> G_eff = 4 * pi^2
+# -----------------------------------------------------------
+
+G = 4 * np.pi**2  # effektive Gravitationskonstante in diesen Einheiten
+
+DAY_IN_YEARS = 1.0 / 365.25   # 1 Tag in Jahren
+days_per_step = 1.0           # über Slider einstellbar
+follow_body = None            # aktuell verfolgter Körper
+sim_time = 0.0                # simulierte Zeit in Jahren
+
+# Referenz-Erdradius in km (für Größen-Skalierung)
+R_EARTH_KM = 6371.0
+
+
+class Body:
+    def __init__(self, name, mass, a=None, e=0.0, inc_deg=0.0, color="white", radius_km=0.0):
+        """
+        name: Name des Körpers
+        mass: Masse in Sonnenmassen
+        a   : große Halbachse in AU (None => kein Kepler-Init, z.B. Sonne, Mond)
+        e   : Exzentrizität
+        inc_deg: Bahnneigung (hier nur für Info/Erweiterungen)
+        color: Plot-Farbe
+        radius_km: physikalischer Radius in Kilometern (für Markergröße)
+        """
+        self.name = name
+        self.mass = mass
+        self.color = color
+        self.radius_km = radius_km
+
+        # Orbitalparameter für ideale Bahnellipse
+        self.a = a
+        self.e = e
+        self.inc_deg = inc_deg
+
+        # Zustand: Position + Geschwindigkeit in 3D
+        if a is None:
+            # Standard: im Ursprung, alles 0 – kann später manuell gesetzt werden (z.B. Sonne, Mond)
+            self.x = 0.0
+            self.y = 0.0
+            self.z = 0.0
+            self.vx = 0.0
+            self.vy = 0.0
+            self.vz = 0.0
+        else:
+            # Start im Perihel im Ekliptik-Plane (z=0)
+            r_peri = a * (1 - e)
+            self.x = r_peri
+            self.y = 0.0
+            self.z = 0.0
+
+            # Perihel-Geschwindigkeit im Bahnebene (vereinfachte Kepler-Formel um die Sonne)
+            v_peri = np.sqrt(G * (1 + e) / (a * (1 - e)))
+            self.vx = 0.0
+            self.vy = v_peri
+            self.vz = 0.0
+
+        # Beschleunigung
+        self.ax = 0.0
+        self.ay = 0.0
+        self.az = 0.0
+
+def compute_accelerations(bodies):
+    """
+    N-Body-Beschleunigungen für alle Körper:
+    a_i = G * Sum_j ( m_j * (r_j - r_i) / |r_j - r_i|^3 )
+    """
+    n = len(bodies)
+    for b in bodies:
+        b.ax = b.ay = b.az = 0.0
+
+    for i in range(n):
+        bi = bodies[i]
+        for j in range(n):
+            if i == j:
+                continue
+            bj = bodies[j]
+            dx = bj.x - bi.x
+            dy = bj.y - bi.y
+            dz = bj.z - bi.z
+
+            r2 = dx*dx + dy*dy + dz*dz
+            r = np.sqrt(r2) + 1e-12  # Schutz vor Division durch 0
+
+            factor = G * bj.mass / (r**3)
+            bi.ax += factor * dx
+            bi.ay += factor * dy
+            bi.az += factor * dz
+
+
+def velocity_verlet_step(bodies, dt):
+    """
+    Ein Integrationsschritt mit Velocity-Verlet für alle Körper.
+    dt: Zeitschritt in Jahren
+    """
+    ax_old = [b.ax for b in bodies]
+    ay_old = [b.ay for b in bodies]
+    az_old = [b.az for b in bodies]
+
+    # Position updaten
+    for i, b in enumerate(bodies):
+        b.x += b.vx * dt + 0.5 * ax_old[i] * dt * dt
+        b.y += b.vy * dt + 0.5 * ay_old[i] * dt * dt
+        b.z += b.vz * dt + 0.5 * az_old[i] * dt * dt
+
+    # neue Beschleunigungen
+    compute_accelerations(bodies)
+
+    # Geschwindigkeit updaten
+    for i, b in enumerate(bodies):
+        b.vx += 0.5 * (ax_old[i] + b.ax) * dt
+        b.vy += 0.5 * (ay_old[i] + b.ay) * dt
+        b.vz += 0.5 * (az_old[i] + b.az) * dt
+
+
+# -----------------------------------------------------------
+# Sonnensystem definieren (Massen in Sonnenmassen, a,e ungefähr real)
+# -----------------------------------------------------------
+
+bodies = []
+
+# Radien in km (ungefähr)
+R_SUN     = 695700.0
+R_MERKUR  = 2439.7
+R_VENUS   = 6051.8
+R_ERDE    = 6371.0
+R_MARS    = 3389.5
+R_JUPITER = 69911.0
+R_SATURN  = 58232.0
+R_URANUS  = 25362.0
+R_NEPTUN  = 24622.0
+R_MOND    = 1737.4
+
+# Sonne
+sun = Body("Sonne", mass=1.0, a=None, color="yellow", radius_km=R_SUN)
+bodies.append(sun)
+
+# Massen der Planeten in Sonnenmassen (ungefähr)
+M_MERKUR  = 1.651e-7
+M_VENUS   = 2.447e-6
+M_ERDE    = 3.003e-6
+M_MARS    = 3.227e-7
+M_JUPITER = 9.545e-4
+M_SATURN  = 2.858e-4
+M_URANUS  = 4.366e-5
+M_NEPTUN  = 5.151e-5
+M_MOND    = M_ERDE * 0.0123  # grob Moon/Earth
+
+# Planeten mit realistischen a, e, groben Inklinationen (Inklination hier nur Info)
+bodies.append(Body("Merkur",  M_MERKUR,  a=0.387,  e=0.2056, inc_deg=7.0,  color="gray",        radius_km=R_MERKUR))
+bodies.append(Body("Venus",   M_VENUS,   a=0.723,  e=0.0068, inc_deg=3.4,  color="orange",      radius_km=R_VENUS))
+bodies.append(Body("Erde",    M_ERDE,    a=1.000,  e=0.0167, inc_deg=0.0,  color="deepskyblue", radius_km=R_ERDE))
+bodies.append(Body("Mars",    M_MARS,    a=1.524,  e=0.0934, inc_deg=1.85, color="red",         radius_km=R_MARS))
+bodies.append(Body("Jupiter", M_JUPITER, a=5.203,  e=0.0489, inc_deg=1.3,  color="sandybrown",  radius_km=R_JUPITER))
+bodies.append(Body("Saturn",  M_SATURN,  a=9.537,  e=0.0542, inc_deg=2.49, color="gold",        radius_km=R_SATURN))
+bodies.append(Body("Uranus",  M_URANUS,  a=19.191, e=0.0472, inc_deg=0.77, color="cyan",        radius_km=R_URANUS))
+bodies.append(Body("Neptun",  M_NEPTUN,  a=30.07,  e=0.0086, inc_deg=1.77, color="blueviolet",  radius_km=R_NEPTUN))
+
+# Erde referenzieren
+earth = next(b for b in bodies if b.name == "Erde")
+
+# Mond hinzufügen – Orbit grob um die Erde
+moon = Body("Mond", M_MOND, a=None, color="lightgray", radius_km=R_MOND)
+r_moon = 0.00257  # Mondbahnradius ~ 384.400 km ≈ 0.00257 AU
+
+moon.x = earth.x + r_moon
+moon.y = earth.y
+moon.z = 0.0
+
+GM_earth = G * earth.mass  # in AU^3 / yr^2
+v_rel = np.sqrt(GM_earth / r_moon)  # Mondorbitalgeschwindigkeit in AU/Jahr
+
+moon.vx = earth.vx
+moon.vy = earth.vy + v_rel
+moon.vz = earth.vz
+
+bodies.append(moon)
+
+# Anfangsbeschleunigungen berechnen
+compute_accelerations(bodies)
+
+# Mapping für Follow-Funktion (ohne Sonne)
+name_to_body = {b.name: b for b in bodies if b.name != "Sonne"}
+
+
+# -----------------------------------------------------------
+# Hilfsfunktion: physikalischer Radius -> Markergröße
+# -----------------------------------------------------------
+def marker_size_from_radius(body: Body) -> float:
+    """
+    Berechnet eine Markergröße aus dem physikalischen Radius.
+    - nutzt echte Radien in km
+    - komprimiert die Spanne mit einer Potenz, damit nichts verschwindet
+    """
+    if body.radius_km <= 0:
+        return 6.0
+
+    # Verhältnis zum Erdradius
+    rel = body.radius_km / R_EARTH_KM  # Erde → 1
+
+    # Größe skalieren: Potenz < 1 komprimiert den Unterschied
+    # Beispiel: Sun (~109) -> 109^0.3 ≈ 4.1
+    size = 4.0 * (rel ** 0.3)
+
+    # Speziell Sonne noch etwas hervorheben
+    if body.name == "Sonne":
+        size *= 1.5
+
+    # Grenzen setzen, damit nichts lächerlich winzig/gigantisch wird
+    size = float(np.clip(size, 3.0, 20.0))
+
+    return size
+
+
+# -----------------------------------------------------------
+# Matplotlib 3D-Setup + Widgets
+# -----------------------------------------------------------
+
+fig = plt.figure(figsize=(9, 9))
+ax = fig.add_subplot(111, projection="3d")
+
+# Platz für Slider & RadioButtons
+plt.subplots_adjust(bottom=0.25, left=0.25)
+
+# Schwarzer Hintergrund, kein grauer Kasten
+ax.set_facecolor("black")
+ax.grid(False)
+
+# Pane (Flächen) transparent machen
+for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+    axis.pane.fill = False
+    axis.pane.set_edgecolor("white")
+
+# Achsengrenzen
+limit = 35  # bis ca. Neptun
+ax.set_xlim(-limit, limit)
+ax.set_ylim(-limit, limit)
+ax.set_zlim(-limit, limit)
+ax.set_box_aspect((1, 1, 1))
+
+ax.set_xlabel("x (AU)", color="white")
+ax.set_ylabel("y (AU)", color="white")
+ax.set_zlabel("z (AU)", color="white")
+
+ax.tick_params(colors="white")
+
+ax.view_init(elev=25, azim=45)
+
+# Hintergrundsterne
+n_stars = 600
+star_radius_min = 60
+star_radius_max = 120
+phi = np.random.uniform(0, 2*np.pi, n_stars)
+costheta = np.random.uniform(-1, 1, n_stars)
+u = np.random.uniform(star_radius_min**3, star_radius_max**3, n_stars)
+r = u**(1/3)
+
+theta = np.arccos(costheta)
+stars_x = r * np.sin(theta) * np.cos(phi)
+stars_y = r * np.sin(theta) * np.sin(phi)
+stars_z = r * np.cos(theta)
+
+ax.scatter(stars_x, stars_y, stars_z, s=1, color="white", alpha=0.5, zorder=0)
+
+# Plots für Himmelskörper mit größengerechten Markern
+body_plots = {}
+for b in bodies:
+    ms = marker_size_from_radius(b)
+    p, = ax.plot([b.x], [b.y], [b.z], "o", color=b.color, markersize=ms, zorder=5)
+    body_plots[b.name] = p
+
+# Ideale Ellipsenbahnen (projiziert in z=0)
+theta_orbit = np.linspace(0, 2 * np.pi, 400)
+for b in bodies:
+    if b.a is None:
+        continue
+    a = b.a
+    e = b.e
+    x_orbit = a * np.cos(theta_orbit) - a * e
+    y_orbit = a * np.sin(theta_orbit) * np.sqrt(1 - e**2)
+    z_orbit = np.zeros_like(x_orbit)
+    ax.plot(x_orbit, y_orbit, z_orbit,
+            linestyle="dashed", color=b.color, alpha=0.3, linewidth=1, zorder=1)
+
+# HUD für simulierte Zeit
+time_text = ax.text2D(0.02, 0.95, "", transform=ax.transAxes, color="white")
+
+
+def update_time_text():
+    global sim_time
+    years = sim_time
+    days_total = years * 365.25
+    time_text.set_text(f"t = {years:.2f} Jahre ({days_total:.0f} Tage)")
+
+
+# -------------------------
+# Slider: "Tage pro Schritt"
+# -------------------------
+ax_speed = plt.axes([0.25, 0.1, 0.7, 0.03])
+speed_slider = Slider(
+    ax=ax_speed,
+    label="Tage pro Schritt",
+    valmin=0.1,
+    valmax=50.0,
+    valinit=1.0,
+    valstep=0.1
+)
+
+def on_speed_change(val):
+    global days_per_step
+    days_per_step = val
+
+speed_slider.on_changed(on_speed_change)
+
+
+# -------------------------
+# RadioButtons: Körper folgen
+# -------------------------
+ax_follow = plt.axes([0.02, 0.3, 0.18, 0.6])
+labels = ["Keiner"] + [b.name for b in bodies if b.name != "Sonne"]
+follow_buttons = RadioButtons(ax_follow, labels, active=0)
+
+def on_follow(label):
+    global follow_body
+    if label == "Keiner":
+        follow_body = None
+    else:
+        follow_body = name_to_body[label]
+
+follow_buttons.on_clicked(on_follow)
+
+
+# ---------------------------------
+# Zoom mit Mausrad (zentriert, optional auf Follow-Body)
+# ---------------------------------
+def on_scroll(event):
+    global follow_body
+    if event.inaxes != ax:
+        return
+
+    if event.button == "up":
+        scale = 0.8   # reinzoomen
+    elif event.button == "down":
+        scale = 1.25  # rauszoomen
+    else:
+        return
+
+    xlim = ax.get_xlim3d()
+    ylim = ax.get_ylim3d()
+    zlim = ax.get_zlim3d()
+
+    if follow_body is not None:
+        cx, cy, cz = follow_body.x, follow_body.y, follow_body.z
+    else:
+        cx = 0.5 * (xlim[0] + xlim[1])
+        cy = 0.5 * (ylim[0] + ylim[1])
+        cz = 0.5 * (zlim[0] + zlim[1])
+
+    new_xlim = [cx + (x - cx) * scale for x in xlim]
+    new_ylim = [cy + (y - cy) * scale for y in ylim]
+    new_zlim = [cz + (z - cz) * scale for z in zlim]
+
+    ax.set_xlim(new_xlim)
+    ax.set_ylim(new_ylim)
+    ax.set_zlim(new_zlim)
+    plt.draw()
+
+fig.canvas.mpl_connect("scroll_event", on_scroll)
+
+
+# -----------------------------------------------------------
+# Animationsfunktion
+# -----------------------------------------------------------
+
+def animate(frame):
+    global sim_time
+
+    dt = days_per_step * DAY_IN_YEARS  # in Jahren
+
+    # Physikupdate
+    velocity_verlet_step(bodies, dt)
+    sim_time += dt
+
+    # Plots updaten
+    for b in bodies:
+        body_plots[b.name].set_data_3d([b.x], [b.y], [b.z])
+
+    # Kamera nachführen, falls Follow aktiv
+    if follow_body is not None:
+        xlim = ax.get_xlim3d()
+        ylim = ax.get_ylim3d()
+        zlim = ax.get_zlim3d()
+        half_x = 0.5 * (xlim[1] - xlim[0])
+        half_y = 0.5 * (ylim[1] - ylim[0])
+        half_z = 0.5 * (zlim[1] - zlim[0])
+
+        cx, cy, cz = follow_body.x, follow_body.y, follow_body.z
+        ax.set_xlim(cx - half_x, cx + half_x)
+        ax.set_ylim(cy - half_y, cy + half_y)
+        ax.set_zlim(cz - half_z, cz + half_z)
+
+    update_time_text()
+
+    return list(body_plots.values()) + [time_text]
+
+
+frames = 5000
+
+ani = FuncAnimation(
+    fig,
+    animate,
+    frames=frames,
+    interval=20,
+    blit=False
+)
+
+plt.title("3D-Sonnensystem (N-Body, Mond, Sterne, Größen-skalierte Planeten)", color="white")
+plt.show()
